@@ -14,6 +14,7 @@ dependencies {
     implementation(libs.bundles.ktor.client)
     implementation(libs.logback.classic)
     implementation(libs.jackson.kotlin)
+    implementation(libs.kotlin.coroutines)
 }
 
 java {
