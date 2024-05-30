@@ -69,6 +69,13 @@ class HomeAssistantWsApiClient(
         override val type: String = "subscribe_events"
     }
 
+    private data class UnsubscribeEventsMsg(
+        override val id: Int,
+        val subscription: Int,
+    ) : CommandMessage {
+        override val type: String = "unsubscribe_events"
+    }
+
     suspend fun runConnection() {
         httpClient.webSocket("wss://$host/api/websocket") {
             println("Connected")
@@ -102,24 +109,40 @@ class HomeAssistantWsApiClient(
         httpClient.close()
     }
 
+    private val subscriptionsMutex = Mutex()
+    private val subscriptions = mutableMapOf<Int, Channel<JsonNode>>()
     private val awaitingResultsMutex = Mutex()
     private val awaitingResults = mutableMapOf<Int, CompletableFuture<JsonNode>>()
     suspend fun processMessages() {
         for (msg in receiverQueue) {
-            awaitingResultsMutex.withLock {
-                val id = msg["id"].asInt() //TODO handle missing id
-                val result = awaitingResults.remove(id)?.complete(msg)
-                when (result) {
-                    true -> println("Handled $id")
-                    false -> println("Received duplicate answer $msg")
-                    null -> println("Received unexpected message $msg")
+            val type = msg["type"].asText()
+            val id = msg["id"].asInt() //TODO handle missing id
+            when (type) {
+                "result" -> awaitingResultsMutex.withLock {
+                    val result = awaitingResults.remove(id)?.complete(msg)
+                    when (result) {
+                        true -> println("Handled $id")
+                        false -> println("Received duplicate answer $msg")
+                        null -> println("Received unexpected message $msg")
+                    }
+                }
+
+                "event" -> subscriptionsMutex.withLock {
+                    val channel = subscriptions[id]
+                    if (channel != null) {
+                        channel.send(msg)
+                    } else {
+                        println("Received event for unknown subscription $msg")
+                    }
                 }
             }
         }
     }
 
-    private suspend fun requestResponse(msg: (Int) -> CommandMessage): JsonNode {
-        val id = nextId.getAndIncrement()
+    private suspend fun requestResponse(
+        id: Int = nextId.getAndIncrement(),
+        msg: (Int) -> CommandMessage
+    ): JsonNode {
         val future = CompletableFuture<JsonNode>()
         awaitingResultsMutex.withLock {
             awaitingResults[id] = future
@@ -134,6 +157,29 @@ class HomeAssistantWsApiClient(
 
     suspend fun getConfig(): JsonNode {
         return requestResponse { GetConfigMessage(it) }
+    }
+
+    suspend fun subscribeEvents(eventType: String? = null): Pair<Int, Channel<JsonNode>> {
+        val id = nextId.getAndIncrement()
+        val channel = Channel<JsonNode>(Channel.UNLIMITED)
+        subscriptionsMutex.withLock {
+            subscriptions[id] = channel
+        }
+        val response = requestResponse(id) { SubscribeEventsMsg(it, eventType) }
+        println("Subscription result: $response")
+        return id to channel
+    }
+
+    suspend fun unsubscribe(subscriptionId: Int) {
+        val rsp = requestResponse {
+            UnsubscribeEventsMsg(it, subscriptionId)
+        }
+        require(rsp["type"].asText() == "result" && rsp["success"].asBoolean()) {
+            "Unsubscribe failed: $rsp"
+        }
+        subscriptionsMutex.withLock {
+            subscriptions.remove(subscriptionId)!!.close()
+        }
     }
 }
 
@@ -155,8 +201,18 @@ fun main() {
         val states = async { homeAssistant.getStates() }
         val config = async { homeAssistant.getConfig() }
         println("Received states")
-        println(states.await().toString())
-        println(config.await().toString())
+
+        val (subscriptionId, stateChangeChannel) = homeAssistant.subscribeEvents("state_changed")
+        launch {
+            for (msg in stateChangeChannel) {
+                println("State changed: ${msg["event"]["data"]["entity_id"]}")
+            }
+            println("Subscription $subscriptionId done")
+        }
+        println("Still here")
+
+        delay(5000)
+        homeAssistant.unsubscribe(subscriptionId)
 
         processingJob.join()
         connectionJob.join()
