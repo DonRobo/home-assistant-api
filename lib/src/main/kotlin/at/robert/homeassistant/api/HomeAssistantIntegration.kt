@@ -1,4 +1,4 @@
-package io.github.homeassistant.api
+package at.robert.homeassistant.api
 
 data class HomeAssistantIntegration(
     val name: String,

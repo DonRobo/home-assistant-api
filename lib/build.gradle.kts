@@ -26,7 +26,7 @@ java {
 publishing {
     publications {
         create<MavenPublication>("maven") {
-            groupId = "io.github.home-assistant-api"
+            groupId = "at.robert.home-assistant-api"
             artifactId = "home-assistant-api"
             version = project.version.toString()
 

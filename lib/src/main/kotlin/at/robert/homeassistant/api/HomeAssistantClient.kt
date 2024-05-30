@@ -1,4 +1,4 @@
-package io.github.homeassistant.api
+package at.robert.homeassistant.api
 
 import com.fasterxml.jackson.databind.JsonNode
 import io.ktor.client.*
