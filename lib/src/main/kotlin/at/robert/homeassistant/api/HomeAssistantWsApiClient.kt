@@ -1,9 +1,12 @@
 package at.robert.homeassistant.api
 
+import at.robert.homeassistant.api.schema.ConfigEntry
+import at.robert.homeassistant.api.schema.DeviceRegistryListEntry
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.treeToValue
 import io.ktor.client.*
 import io.ktor.client.engine.java.*
 import io.ktor.client.plugins.websocket.*
@@ -14,6 +17,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.slf4j.LoggerFactory
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -23,9 +27,12 @@ class HomeAssistantWsApiClient(
     coroutineScope: CoroutineScope,
 ) {
 
+    private val log = LoggerFactory.getLogger(HomeAssistantWsApiClient::class.java)
+
     private val nextId = AtomicInteger(1)
 
-    private val objectMapper = jacksonObjectMapper().also { om ->
+    @Suppress("MemberVisibilityCanBePrivate")
+    val objectMapper = jacksonObjectMapper().also { om ->
         om.propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
         om.setSerializationInclusion(JsonInclude.Include.NON_NULL)
     }
@@ -83,14 +90,14 @@ class HomeAssistantWsApiClient(
     private val websocketJob: Job = coroutineScope.launch {
         httpClient.webSocket("wss://$host/api/websocket") {
             con = this
-            println("Connected")
+            log.debug("Websocket connection to \"wss://$host/api/websocket\" established")
 
             val authRequiredMsg: JsonNode = receiveDeserialized()
             require(authRequiredMsg["type"].asText() == "auth_required")
             sendSerialized(AuthMessage(accessToken))
             val authOk: JsonNode = receiveDeserialized()
             require(authOk["type"].asText() == "auth_ok")
-            println("Authenticated, ready to do commands")
+            log.debug("Authenticated successfully")
 
             val receiverJob = launch {
                 while (con.isActive) {
@@ -98,14 +105,16 @@ class HomeAssistantWsApiClient(
                     receiverQueue.send(msg)
                 }
                 receiverQueue.close()
-                println("Receiver job stopped because connection is no longer active")
+                log.trace("Receiver job stopped because connection is no longer active")
             }
             val senderJob = launch {
                 for (msg in senderQueue) {
                     sendSerialized(msg)
-                    println("Sent: $msg")
+                    if (log.isTraceEnabled) {
+                        log.trace("Sent: ${objectMapper.writeValueAsString(msg)}")
+                    }
                 }
-                println("Sender job stopped because senderQueue is closed")
+                log.trace("Sender job stopped because senderQueue is closed")
             }
             val processingJob = launch {
                 for (msg in receiverQueue) {
@@ -113,11 +122,16 @@ class HomeAssistantWsApiClient(
                     val id = msg["id"].asInt() //TODO handle missing id
                     when (type) {
                         "result" -> awaitingResultsMutex.withLock {
-                            val result = awaitingResults.remove(id)?.complete(msg)
-                            when (result) {
-                                true -> println("Handled $id")
-                                false -> println("Received duplicate answer $msg")
-                                null -> println("Received unexpected message $msg")
+                            val success = msg["success"].asBoolean()
+                            val result = awaitingResults.remove(id)
+                            if (success) {
+                                when (result?.complete(msg["result"])) {
+                                    true -> log.trace("Handled $id")
+                                    false -> log.error("Received duplicate answer $msg")
+                                    null -> log.error("Received unexpected message $msg")
+                                }
+                            } else {
+                                result?.completeExceptionally(RuntimeException("Request failed: $msg"))
                             }
                         }
 
@@ -126,7 +140,7 @@ class HomeAssistantWsApiClient(
                             if (channel != null) {
                                 channel.send(msg)
                             } else {
-                                println("Received event for unknown subscription $msg")
+                                log.error("Received event for unknown subscription $msg")
                             }
                         }
                     }
@@ -160,6 +174,28 @@ class HomeAssistantWsApiClient(
         return requestResponse { GetConfigMessage(it) }
     }
 
+    suspend fun getConfigEntries(): List<ConfigEntry> {
+        return requestResponse { id ->
+            object : CommandMessage {
+                override val id: Int = id
+                override val type: String = "config_entries/get"
+            }
+        }.let {
+            objectMapper.treeToValue<List<ConfigEntry>>(it)
+        }
+    }
+
+    suspend fun getDeviceRegistryList(): List<DeviceRegistryListEntry> {
+        return requestResponse { id ->
+            object : CommandMessage {
+                override val id: Int = id
+                override val type: String = "config/device_registry/list"
+            }
+        }.let {
+            objectMapper.treeToValue<List<DeviceRegistryListEntry>>(it)
+        }
+    }
+
     suspend fun subscribeEvents(eventType: String? = null): Pair<Int, Channel<JsonNode>> {
         require(!closed) { "Client is closed" }
         val id = nextId.getAndIncrement()
@@ -168,7 +204,9 @@ class HomeAssistantWsApiClient(
             subscriptions[id] = channel
         }
         val response = requestResponse(id) { SubscribeEventsMsg(it, eventType) }
-        println("Subscription result: $response")
+        if (log.isTraceEnabled) {
+            log.trace("Subscription result: $response")
+        }
         return id to channel
     }
 
@@ -204,38 +242,30 @@ class HomeAssistantWsApiClient(
     }
 }
 
-fun main() {
+fun main(args: Array<String>) {
     val accessToken = System.getenv("HOME_ASSISTANT_ACCESS_TOKEN")
         ?: error("HOME_ASSISTANT_ACCESS_TOKEN env var not set")
+    val host = args.single()
 
     runBlocking {
         val homeAssistant = HomeAssistantWsApiClient(
-            "robohome.duckdns.org", accessToken, this
+            host, accessToken, this
         )
 
-        val states = async { homeAssistant.getStates() }
-        val config = async { homeAssistant.getConfig() }
-        println("Received states")
-
-        val (subscriptionId, stateChangeChannel) = homeAssistant.subscribeEvents("state_changed")
-        launch {
-            for (msg in stateChangeChannel) {
-                println("State changed: ${msg["event"]["data"]["entity_id"]}")
-            }
-            println("Subscription $subscriptionId done")
-        }
-        println("Still here")
-
-        delay(5000)
-        homeAssistant.unsubscribe(subscriptionId)
-        println("Unsubscribed")
-        delay(1000)
-        launch {
-            homeAssistant.getStates().let {
-                println("States received a second time")
+        val shellys = async {
+            homeAssistant.getConfigEntries().filter {
+                it.domain == "shelly"
             }
         }
-        delay(100)
+        val deviceRegistryList = async { homeAssistant.getDeviceRegistryList() }
+        val shellyEntryIds = shellys.await().map { it.entryId }.toSet()
+        val shellyDeviceRegistryEntries = deviceRegistryList.await().filter {
+            it.configEntries.any { entryId -> shellyEntryIds.contains(entryId) }
+        }
+        shellyDeviceRegistryEntries.forEach {
+            println("${it.nameByUser ?: it.name}: ${it.configurationUrl}")
+        }
+
         homeAssistant.disconnect()
         println("Disconnected")
     }
