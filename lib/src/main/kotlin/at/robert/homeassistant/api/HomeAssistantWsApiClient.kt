@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class HomeAssistantWsApiClient(
     private val host: String,
     private val accessToken: String,
-    private val coroutineScope: CoroutineScope,
+    coroutineScope: CoroutineScope,
 ) {
 
     private val nextId = AtomicInteger(1)
@@ -37,6 +37,7 @@ class HomeAssistantWsApiClient(
     }
 
     private data class AuthMessage(val accessToken: String) {
+        @Suppress("unused")
         val type: String = "auth"
     }
 
