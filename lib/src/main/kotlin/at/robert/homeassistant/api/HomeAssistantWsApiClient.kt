@@ -8,6 +8,7 @@ import io.ktor.client.*
 import io.ktor.client.engine.java.*
 import io.ktor.client.plugins.websocket.*
 import io.ktor.serialization.jackson.*
+import io.ktor.websocket.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.future.await
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class HomeAssistantWsApiClient(
     private val host: String,
     private val accessToken: String,
+    private val coroutineScope: CoroutineScope,
 ) {
 
     private val nextId = AtomicInteger(1)
@@ -33,13 +35,6 @@ class HomeAssistantWsApiClient(
             contentConverter = JacksonWebsocketContentConverter(objectMapper)
         }
     }
-
-    private val senderQueue = Channel<Any>(Channel.UNLIMITED)
-    suspend fun send(msg: Any) {
-        senderQueue.send(msg)
-    }
-
-    private val receiverQueue = Channel<JsonNode>(Channel.UNLIMITED)
 
     private data class AuthMessage(val accessToken: String) {
         val type: String = "auth"
@@ -76,10 +71,18 @@ class HomeAssistantWsApiClient(
         override val type: String = "unsubscribe_events"
     }
 
-    suspend fun runConnection() {
+    private val senderQueue = Channel<Any>(Channel.UNLIMITED)
+    private val receiverQueue = Channel<JsonNode>(Channel.UNLIMITED)
+    private val subscriptionsMutex = Mutex()
+    private val subscriptions = mutableMapOf<Int, Channel<JsonNode>>()
+    private val awaitingResultsMutex = Mutex()
+    private val awaitingResults = mutableMapOf<Int, CompletableFuture<JsonNode>>()
+
+    private lateinit var con: DefaultClientWebSocketSession
+    private val websocketJob: Job = coroutineScope.launch {
         httpClient.webSocket("wss://$host/api/websocket") {
+            con = this
             println("Connected")
-            val con = this
 
             val authRequiredMsg: JsonNode = receiveDeserialized()
             require(authRequiredMsg["type"].asText() == "auth_required")
@@ -103,51 +106,48 @@ class HomeAssistantWsApiClient(
                 }
                 println("Sender job stopped because senderQueue is closed")
             }
-            receiverJob.join()
-            senderJob.cancelAndJoin()
-        }
-        httpClient.close()
-    }
+            val processingJob = launch {
+                for (msg in receiverQueue) {
+                    val type = msg["type"].asText()
+                    val id = msg["id"].asInt() //TODO handle missing id
+                    when (type) {
+                        "result" -> awaitingResultsMutex.withLock {
+                            val result = awaitingResults.remove(id)?.complete(msg)
+                            when (result) {
+                                true -> println("Handled $id")
+                                false -> println("Received duplicate answer $msg")
+                                null -> println("Received unexpected message $msg")
+                            }
+                        }
 
-    private val subscriptionsMutex = Mutex()
-    private val subscriptions = mutableMapOf<Int, Channel<JsonNode>>()
-    private val awaitingResultsMutex = Mutex()
-    private val awaitingResults = mutableMapOf<Int, CompletableFuture<JsonNode>>()
-    suspend fun processMessages() {
-        for (msg in receiverQueue) {
-            val type = msg["type"].asText()
-            val id = msg["id"].asInt() //TODO handle missing id
-            when (type) {
-                "result" -> awaitingResultsMutex.withLock {
-                    val result = awaitingResults.remove(id)?.complete(msg)
-                    when (result) {
-                        true -> println("Handled $id")
-                        false -> println("Received duplicate answer $msg")
-                        null -> println("Received unexpected message $msg")
-                    }
-                }
-
-                "event" -> subscriptionsMutex.withLock {
-                    val channel = subscriptions[id]
-                    if (channel != null) {
-                        channel.send(msg)
-                    } else {
-                        println("Received event for unknown subscription $msg")
+                        "event" -> subscriptionsMutex.withLock {
+                            val channel = subscriptions[id]
+                            if (channel != null) {
+                                channel.send(msg)
+                            } else {
+                                println("Received event for unknown subscription $msg")
+                            }
+                        }
                     }
                 }
             }
+            receiverJob.join()
+            processingJob.join()
+            senderJob.cancelAndJoin()
         }
+        httpClient.close()
     }
 
     private suspend fun requestResponse(
         id: Int = nextId.getAndIncrement(),
         msg: (Int) -> CommandMessage
     ): JsonNode {
+        require(!closed) { "Client is closed" }
         val future = CompletableFuture<JsonNode>()
         awaitingResultsMutex.withLock {
             awaitingResults[id] = future
         }
-        send(msg(id))
+        senderQueue.send(msg(id))
         return future.await()
     }
 
@@ -160,6 +160,7 @@ class HomeAssistantWsApiClient(
     }
 
     suspend fun subscribeEvents(eventType: String? = null): Pair<Int, Channel<JsonNode>> {
+        require(!closed) { "Client is closed" }
         val id = nextId.getAndIncrement()
         val channel = Channel<JsonNode>(Channel.UNLIMITED)
         subscriptionsMutex.withLock {
@@ -181,6 +182,25 @@ class HomeAssistantWsApiClient(
             subscriptions.remove(subscriptionId)!!.close()
         }
     }
+
+    private var closed = false
+    suspend fun disconnect() {
+        closed = true
+        senderQueue.close()
+        receiverQueue.close()
+        con.close()
+        subscriptionsMutex.withLock {
+            subscriptions.values.forEach { it.close() }
+            subscriptions.clear()
+        }
+        awaitingResultsMutex.withLock {
+            awaitingResults.values.forEach {
+                it.completeExceptionally(CancellationException())
+            }
+            awaitingResults.clear()
+        }
+        websocketJob.join()
+    }
 }
 
 fun main() {
@@ -189,14 +209,8 @@ fun main() {
 
     runBlocking {
         val homeAssistant = HomeAssistantWsApiClient(
-            "robohome.duckdns.org", accessToken,
+            "robohome.duckdns.org", accessToken, this
         )
-        val connectionJob = launch {
-            homeAssistant.runConnection()
-        }
-        val processingJob = launch {
-            homeAssistant.processMessages()
-        }
 
         val states = async { homeAssistant.getStates() }
         val config = async { homeAssistant.getConfig() }
@@ -213,9 +227,17 @@ fun main() {
 
         delay(5000)
         homeAssistant.unsubscribe(subscriptionId)
-
-        processingJob.join()
-        connectionJob.join()
+        println("Unsubscribed")
+        delay(1000)
+        launch {
+            homeAssistant.getStates().let {
+                println("States received a second time")
+            }
+        }
+        delay(100)
+        homeAssistant.disconnect()
         println("Disconnected")
     }
+
+    println("Done")
 }
