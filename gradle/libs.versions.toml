@@ -26,3 +26,4 @@ ktor-client = [
 
 [plugins]
 jvm = { id = "org.jetbrains.kotlin.jvm", version = "2.0.0" }
+graalvm-native = { id = "org.graalvm.buildtools.native", version = "0.10.2" }

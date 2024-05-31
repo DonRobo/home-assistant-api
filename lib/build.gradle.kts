@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.jvm)
+    alias(libs.plugins.graalvm.native)
     `java-library`
     `maven-publish`
 }
@@ -32,5 +33,20 @@ publishing {
 
             from(components["java"])
         }
+    }
+}
+
+
+
+graalvmNative {
+    binaries {
+        named("main") {
+            imageName.set("ha-cli")
+            mainClass.set("at.robert.homeassistant.api.HomeAssistantWsApiClientKt")
+            buildArgs.add("-O4")
+        }
+    }
+    binaries.all {
+        buildArgs.add("--verbose")
     }
 }
