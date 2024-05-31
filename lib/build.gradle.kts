@@ -1,7 +1,7 @@
 plugins {
     alias(libs.plugins.jvm)
     alias(libs.plugins.graalvm.native)
-    `java-library`
+    application
     `maven-publish`
 }
 
@@ -36,8 +36,6 @@ publishing {
     }
 }
 
-
-
 graalvmNative {
     binaries {
         named("main") {
@@ -49,4 +47,8 @@ graalvmNative {
     binaries.all {
         buildArgs.add("--verbose")
     }
+}
+
+application {
+    mainClass = "at.robert.homeassistant.api.HomeAssistantWsApiClientKt"
 }

@@ -245,7 +245,7 @@ class HomeAssistantWsApiClient(
 fun main(args: Array<String>) {
     val accessToken = System.getenv("HOME_ASSISTANT_ACCESS_TOKEN")
         ?: error("HOME_ASSISTANT_ACCESS_TOKEN env var not set")
-    val host = args.single()
+    val host = args.singleOrNull() ?: error("Usage: ha-cli <host>")
 
     runBlocking {
         val homeAssistant = HomeAssistantWsApiClient(

@@ -20,7 +20,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build with Gradle Wrapper
-        run: ./gradlew nativeBuild
+        run: ./gradlew nativeCompile
 
       - name: Upload binary
         uses: actions/upload-artifact@v2
